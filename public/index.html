@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Unified Address Autocomplete Demo</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <h1>Unified Address Autocomplete</h1>
+  <p class="sub">Backed by HERE, Mapbox, LocationIQ, and Photon — with server-side caching.</p>
+
+  <div class="controls">
+    <label for="provider-select">Provider:</label>
+    <select id="provider-select">
+      <option value="auto">Auto (fallback chain)</option>
+      <option value="here">HERE</option>
+      <option value="mapbox">Mapbox</option>
+      <option value="locationiq">LocationIQ</option>
+      <option value="opencage">OpenCage</option>
+      <option value="geoapify">Geoapify</option>
+      <option value="pelias">Pelias</option>
+      <option value="photon">Photon</option>
+      <option value="nominatim">Nominatim (OSM)</option>
+    </select>
+    <button id="clear-cache-btn">Clear server cache</button>
+  </div>
+
+  <input id="address-input" type="text" placeholder="Start typing an address…" />
+
+  <div id="result-box" class="result-box" hidden></div>
+
+  <h2 class="usage-heading">Free-tier usage</h2>
+  <div id="usage-panel" class="usage-panel"></div>
+
+  <h2 class="compare-heading">Compare all providers</h2>
+  <p class="sub">Fires every configured provider at once for the same query, times each, and scores how well its top result matches what you typed — some providers just won't have a given address.</p>
+  <div class="compare-controls">
+    <input id="compare-input" type="text" placeholder="Type a full address to compare…" />
+    <button id="compare-btn">Compare</button>
+  </div>
+  <div id="compare-results" class="compare-results"></div>
+
+  <script src="/autocomplete.js"></script>
+  <script>
+    const input = document.getElementById('address-input');
+    const providerSelect = document.getElementById('provider-select');
+    const resultBox = document.getElementById('result-box');
+    const clearCacheBtn = document.getElementById('clear-cache-btn');
+
+    const usagePanel = document.getElementById('usage-panel');
+
+    async function refreshUsage() {
+      const res = await fetch('/api/usage');
+      const data = await res.json();
+      usagePanel.innerHTML = data.providers.map((p) => {
+        const q = p.quota;
+        if (!p.configured) return `<div class="usage-row usage-row-disabled">${p.name}: not configured</div>`;
+        if (!q.metered) return `<div class="usage-row">${p.name}: unmetered</div>`;
+        const pct = q.limit > 0 ? Math.min(100, Math.round((q.used / q.limit) * 100)) : 100;
+        const state = q.exhausted ? 'usage-row-exhausted' : '';
+        return `<div class="usage-row ${state}">
+          <span>${p.name}: ${q.used.toLocaleString()} / ${q.limit.toLocaleString()} (${q.window})</span>
+          <div class="usage-bar"><div class="usage-bar-fill" style="width:${pct}%"></div></div>
+        </div>`;
+      }).join('');
+    }
+
+    const autocomplete = new AddressAutocomplete(input, {
+      provider: providerSelect.value,
+      limit: 6,
+      onSelect: (result) => {
+        resultBox.hidden = false;
+        resultBox.textContent = JSON.stringify(result, null, 2);
+        refreshUsage();
+      },
+    });
+
+    providerSelect.addEventListener('change', () => {
+      autocomplete.setProvider(providerSelect.value);
+    });
+
+    refreshUsage();
+    setInterval(refreshUsage, 5000);
+
+    // --- Compare-all-providers panel ---
+    const compareInput = document.getElementById('compare-input');
+    const compareBtn = document.getElementById('compare-btn');
+    const compareResults = document.getElementById('compare-results');
+
+    const STATUS_LABEL = {
+      not_configured: 'Not configured',
+      quota_exhausted: 'Quota exhausted',
+      error: 'Error',
+    };
+
+    function rowStatusLabel(row) {
+      if (row.status === 'ok') {
+        if (row.exactMatch) return 'Exact match';
+        if (row.hasMatch) return 'Partial match';
+        return 'No address found';
+      }
+      return STATUS_LABEL[row.status] || row.status;
+    }
+
+    function rowStatusClass(row) {
+      if (row.status === 'ok' && row.exactMatch) return 'compare-exact';
+      if (row.status === 'ok' && row.hasMatch) return 'compare-partial';
+      if (row.status === 'ok') return 'compare-none';
+      return 'compare-unavailable';
+    }
+
+    function escapeHtml(str) {
+      return String(str).replace(/[&<>"']/g, (c) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+      }[c]));
+    }
+
+    async function runCompare() {
+      const query = compareInput.value.trim();
+      if (query.length < 2) return;
+
+      compareBtn.disabled = true;
+      compareResults.innerHTML = '<p class="compare-status">Comparing all providers…</p>';
+
+      try {
+        const params = new URLSearchParams({ q: query, limit: '3' });
+        const res = await fetch(`/api/compare?${params.toString()}`);
+        const data = await res.json();
+
+        if (!data.comparisons || data.comparisons.length === 0) {
+          compareResults.innerHTML = '<p class="compare-status">No providers to compare.</p>';
+          return;
+        }
+
+        const rankIndex = new Map(data.ranked.map((p, i) => [p, i]));
+        const rows = [...data.comparisons].sort((a, b) => {
+          const ai = rankIndex.has(a.provider) ? rankIndex.get(a.provider) : 999;
+          const bi = rankIndex.has(b.provider) ? rankIndex.get(b.provider) : 999;
+          return ai - bi;
+        });
+
+        const bodyRows = rows.map((r) => {
+          const rank = rankIndex.has(r.provider) ? rankIndex.get(r.provider) + 1 : '—';
+          const latency = r.latencyMs != null ? `${r.latencyMs} ms${r.cached ? ' (cached)' : ''}` : '—';
+          const matchCell = r.status === 'ok'
+            ? (r.exactMatch ? '✓ exact' : r.hasMatch ? `~ ${r.bestMatch.match.score}` : '—')
+            : '—';
+          const bestLabel = r.status === 'ok'
+            ? (r.bestMatch ? r.bestMatch.label : 'No results')
+            : (r.error || STATUS_LABEL[r.status] || '');
+
+          return `<tr class="${rowStatusClass(r)}">
+            <td>${rank}</td>
+            <td>${escapeHtml(r.provider)}</td>
+            <td>${rowStatusLabel(r)}</td>
+            <td>${latency}</td>
+            <td>${matchCell}</td>
+            <td>${escapeHtml(bestLabel)}</td>
+          </tr>`;
+        }).join('');
+
+        compareResults.innerHTML = `
+          <table class="compare-table">
+            <thead>
+              <tr><th>#</th><th>Provider</th><th>Status</th><th>Latency</th><th>Match</th><th>Best result</th></tr>
+            </thead>
+            <tbody>${bodyRows}</tbody>
+          </table>
+          <p class="compare-note">Ranked by exact match first, then match quality, then response speed. "Match" is a heuristic score against your typed text — spot-check anything important.</p>
+        `;
+      } catch (err) {
+        compareResults.innerHTML = `<p class="compare-status">Error: ${escapeHtml(err.message)}</p>`;
+      } finally {
+        compareBtn.disabled = false;
+        refreshUsage();
+      }
+    }
+
+    compareBtn.addEventListener('click', runCompare);
+    compareInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') runCompare();
+    });
+
+    clearCacheBtn.addEventListener('click', async () => {
+      await fetch('/api/cache/clear', { method: 'POST' });
+      clearCacheBtn.textContent = 'Cache cleared ✓';
+      setTimeout(() => (clearCacheBtn.textContent = 'Clear server cache'), 1500);
+    });
+
+    // Optional: bias results toward the user's current location.
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => autocomplete.setLocation(pos.coords.latitude, pos.coords.longitude),
+        () => {}, // silently ignore if denied
+        { timeout: 3000 }
+      );
+    }
+  </script>
+</body>
+</html>
