@@ -2,7 +2,8 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
-const { TTLCache } = require('./cache');
+const { createCache, KEY_PREFIX } = require('./cacheStore');
+const { reportThirdPartyError } = require('./alerts');
 const { UsageTracker, DEFAULT_LIMITS } = require('./usageTracker');
 const { scoreMatch } = require('./matchScore');
 const { listProviders, runProvider, PROVIDERS } = require('./providers');
@@ -10,11 +11,13 @@ const { listProviders, runProvider, PROVIDERS } = require('./providers');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS) || 5 * 60 * 1000; // 5 min
+// Addresses rarely change, so cache successful results for 30 days by default.
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS) || 30 * 24 * 60 * 60 * 1000;
 const CACHE_MAX_SIZE = Number(process.env.CACHE_MAX_SIZE) || 1000;
 const MIN_QUERY_LENGTH = Number(process.env.MIN_QUERY_LENGTH) || 2;
 
-const cache = new TTLCache({ ttlMs: CACHE_TTL_MS, maxSize: CACHE_MAX_SIZE });
+// Redis when REDIS_URL is set (persists across deploys), otherwise in-memory.
+const cache = createCache({ ttlMs: CACHE_TTL_MS, maxSize: CACHE_MAX_SIZE });
 
 // Parses an env var as a non-negative integer, falling back to `fallback`
 // when unset/invalid. Deliberately NOT `Number(x) || fallback` — that
@@ -67,7 +70,7 @@ function buildCacheKey(provider, query, { limit, lat, lon, countryCode }) {
   // missing on every pixel of GPS jitter.
   const roundedLat = lat != null ? Number(lat).toFixed(3) : '';
   const roundedLon = lon != null ? Number(lon).toFixed(3) : '';
-  return [provider, normalizedQuery, limit, roundedLat, roundedLon, countryCode || ''].join('|');
+  return KEY_PREFIX + [provider, normalizedQuery, limit, roundedLat, roundedLon, countryCode || ''].join('|');
 }
 
 async function searchWithCache(provider, query, options) {
@@ -75,12 +78,23 @@ async function searchWithCache(provider, query, options) {
 
   // A cache hit costs zero quota — this is the first line of defense
   // against exhausting a free tier, before we even look at usage.
-  const cached = cache.get(key);
+  // A cache outage is treated as a miss, so searches keep working.
+  let cached;
+  try {
+    cached = await cache.get(key);
+  } catch (err) {
+    console.error('[cache] read failed:', err.message);
+  }
   if (cached) {
     return { results: cached, cached: true, quota: usageTracker.status(provider) };
   }
 
   if (usageTracker.isExhausted(provider)) {
+    reportThirdPartyError({
+      service: provider,
+      operation: 'autocomplete',
+      message: `${provider} free-tier quota is exhausted for this period; requests are being skipped.`,
+    });
     throw new QuotaExhaustedError(provider, usageTracker.status(provider));
   }
 
@@ -88,13 +102,22 @@ async function searchWithCache(provider, query, options) {
     const results = await runProvider(provider, query, options);
     // Only count it once the request actually reached the upstream API.
     usageTracker.increment(provider);
-    cache.set(key, results);
+    // Empty results aren't cached, so an address the provider doesn't know
+    // yet can be found on a later search.
+    if (results.length > 0) {
+      cache.set(key, results).catch((err) => console.error('[cache] write failed:', err.message));
+    }
     return { results, cached: false, quota: usageTracker.status(provider) };
   } catch (err) {
     // Requests rejected locally (e.g. missing API key) never left our
     // server, so they shouldn't count against the provider's quota.
     if (!/is not configured/.test(err.message)) {
       usageTracker.increment(provider);
+      reportThirdPartyError({
+        service: provider,
+        operation: 'autocomplete',
+        message: err.message,
+      });
     }
     throw err;
   }
@@ -302,12 +325,12 @@ app.get('/api/compare', async (req, res) => {
   res.json({ query, comparisons, ranked });
 });
 
-app.get('/api/cache/stats', (req, res) => {
-  res.json(cache.stats());
+app.get('/api/cache/stats', async (req, res) => {
+  res.json(await cache.stats());
 });
 
-app.post('/api/cache/clear', (req, res) => {
-  cache.clear();
+app.post('/api/cache/clear', async (req, res) => {
+  await cache.clear();
   res.json({ cleared: true });
 });
 
