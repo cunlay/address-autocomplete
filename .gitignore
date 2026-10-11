@@ -47,3 +47,10 @@ example
 /android
 /nlog
 /scripts
+<<<<<<< HEAD
+=======
+.env
+.env.*
+node_modules/
+*.log
+>>>>>>> d274ea1 (Initial commit: address-autocomplete)
